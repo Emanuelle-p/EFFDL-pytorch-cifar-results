@@ -25,10 +25,6 @@ class NTCE_KD_Loss(nn.Module):
     computed from teacher and student logits. It focuses on non-target class behavior by
     applying target-logit shrinkage before KL computation.
 
-    Args:
-        temperature (float): Temperature used to soften probabilities.
-        alpha (float): Weight applied to CrossEntropy loss.
-        beta (float): Weight applied to MKL distillation loss.
     """
 
     def __init__(self, temperature: float = 4.0, alpha: float = 1.0, beta: float = 8.0):
@@ -61,12 +57,8 @@ class NTCE_KD_Loss(nn.Module):
     ) -> torch.Tensor:
         """
         Compute NTCE-KD loss.
-
-        Supports both call styles:
-        - CE mode: criterion(student_logits, targets)
-        - KD mode: criterion(student_logits, teacher_logits, targets)
         """
-        # Backward-compatible CE style: criterion(logits, targets)
+      
         if targets is None and teacher_logits is not None and teacher_logits.dim() == 1:
             targets = teacher_logits
             teacher_logits = None
@@ -102,10 +94,11 @@ class NTCE_KD_Loss(nn.Module):
             student_logits_modified = self._apply_target_shrinkage(student_logits, targets, delta)
             teacher_logits_modified = self._apply_target_shrinkage(teacher_logits, targets, delta)
 
+            #we can verify that the temperature cames after the shinkage, the shinkage is necessary to enhance the non-target classes
             log_probs_student = F.log_softmax(student_logits_modified / self.temperature, dim=1)
             probs_teacher = F.softmax(teacher_logits_modified / self.temperature, dim=1)
 
-            kl_div = F.kl_div(log_probs_student, probs_teacher, reduction="batchmean")
+            kl_div = F.kl_div(log_probs_student, probs_teacher, reduction='batchmean')
             kl_losses.append(kl_div)
 
         mkl_loss = torch.stack(kl_losses).mean() * (self.temperature ** 2)
@@ -565,14 +558,9 @@ def retrain_after_pruning(
     wandb_log
 ):
     """
-   - Carrega o modelo do checkpoint
-   - Aplica pruning global (L1)
-   - Faz retraining para recuperar acurácia
-   - Retorna modelo treinado, histórico e sparsidade
+   - pruning global (L1)
     """
     
-    # Aplica pruning global (mantendo peso_orig e máscara)
-    #global_pruning(model, amount=amount)
     
     history_retrain = {
     "epoch": [],
@@ -583,10 +571,8 @@ def retrain_after_pruning(
     "lr": [],
 }
 
-    # Checa sparsidade inicial pós-pruning
     sparsity_dict = check_sparsity(model, verbose=True)
     
-    # Otimizador e scheduler
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=retrain_lr,
                                 momentum=hparams['momentum'],
@@ -605,7 +591,6 @@ def retrain_after_pruning(
         test_loss, test_acc, best_acc = test(model, best_acc, epoch, testloader, criterion, device, checkpoint_name=checkpoint_name)
         scheduler.step()
 
-        # Atualiza histórico
         history_retrain["epoch"].append(epoch)
         history_retrain["train_loss"].append(train_loss)
         history_retrain["test_loss"].append(test_loss)
@@ -613,7 +598,6 @@ def retrain_after_pruning(
         history_retrain["test_acc"].append(test_acc)
         history_retrain["lr"].append(optimizer.param_groups[0]['lr'])
 
-        # Log no W&B se passado
         if wandb_log:
             wandb_log({
                 "retrain/epoch": epoch,
@@ -627,7 +611,7 @@ def retrain_after_pruning(
 
         if test_acc > best_acc:
             best_acc = test_acc
-            # opcional: salvar checkpoint do modelo pós-retrain
+            
             torch.save(model.state_dict(), f"retrained_pruned_{int(amount*100)}.pth")
 
     return model, history_retrain, sparsity_dict
@@ -690,7 +674,7 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
 
                 conv.register_forward_hook(get_activation("conv"))
 
-                # roda um batch normal
+                # batch normal
                 _ = model(inputs)
 
                 feat_in = activation["conv"]
@@ -703,7 +687,6 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
         X = torch.cat(X_list, dim=0)
         Y = torch.cat(Y_list, dim=0)
 
-        # Seleção gulosa de canais
         num_prune = int(C * pruning_ratio)
         if num_prune == 0:
             continue
@@ -725,7 +708,6 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
             selected.remove(worst)
             pruned.append(worst)
 
-        # Physical removal da camada atual (conv)
         kept = selected
         new_conv = nn.Conv2d(
             in_channels=conv.in_channels,
@@ -741,7 +723,6 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
             if conv.bias is not None:
                 new_conv.bias.copy_(conv.bias[kept])
 
-        # Reconstruir próxima camada com input reduzido
         new_next_conv = nn.Conv2d(
             in_channels=len(kept),
             out_channels=next_conv.out_channels,
@@ -756,7 +737,6 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
             if next_conv.bias is not None:
                 new_next_conv.bias.copy_(next_conv.bias)
 
-        # Substituir módulos no modelo
         def replace_module(model, old_module, new_module):
             for name, module in model.named_modules():
                 if module is old_module:
@@ -772,7 +752,6 @@ def apply_thinet(model, trainloader, device, pruning_ratio, num_batches=10):
 
         sparsity_dict[f"conv_{i}"] = 100. * len(pruned) / C
 
-    # Sparsity global
     total = 0
     zero = 0
     for m in [m for m in model_to_prune.modules() if isinstance(m, nn.Conv2d)]:
