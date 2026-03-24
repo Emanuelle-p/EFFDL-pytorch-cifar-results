@@ -14,6 +14,103 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from collections import OrderedDict
+from typing import Optional
+
+
+class NTCE_KD_Loss(nn.Module):
+    """
+    Non-Target-Class-Enhanced Knowledge Distillation loss.
+
+    This criterion combines standard CrossEntropy loss with Magnitude-Enhanced KL (MKL)
+    computed from teacher and student logits. It focuses on non-target class behavior by
+    applying target-logit shrinkage before KL computation.
+
+    Args:
+        temperature (float): Temperature used to soften probabilities.
+        alpha (float): Weight applied to CrossEntropy loss.
+        beta (float): Weight applied to MKL distillation loss.
+    """
+
+    def __init__(self, temperature: float = 4.0, alpha: float = 1.0, beta: float = 8.0):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+
+        # Shrinkage coefficients used in the multi-branch MKL computation.
+        self.register_buffer(
+            "shrinkage_coeffs",
+            torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        )
+
+        # Standard CE term for hard labels.
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def _apply_target_shrinkage(self, logits: torch.Tensor, targets: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """Apply shrinkage only to the target-class logit for each sample."""
+        modified_logits = logits.clone()
+        batch_indices = torch.arange(logits.size(0), device=logits.device)
+        modified_logits[batch_indices, targets] = modified_logits[batch_indices, targets] - delta
+        return modified_logits
+
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: Optional[torch.Tensor] = None,
+        targets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute NTCE-KD loss.
+
+        Supports both call styles:
+        - CE mode: criterion(student_logits, targets)
+        - KD mode: criterion(student_logits, teacher_logits, targets)
+        """
+        # Backward-compatible CE style: criterion(logits, targets)
+        if targets is None and teacher_logits is not None and teacher_logits.dim() == 1:
+            targets = teacher_logits
+            teacher_logits = None
+
+        if targets is None:
+            raise ValueError("NTCE_KD_Loss requires targets.")
+
+        targets = targets.view(-1).long()
+        ce_loss = self.ce_loss(student_logits, targets)
+
+        # In pure evaluation/inference mode, fallback to CE only.
+        if teacher_logits is None:
+            return self.alpha * ce_loss
+
+        batch_size, num_classes = student_logits.size()
+        device = student_logits.device
+        batch_indices = torch.arange(batch_size, device=device)
+        shrinkage_coeffs = self.shrinkage_coeffs.to(device=device, dtype=student_logits.dtype)
+
+        # Teacher is used as a fixed target distribution.
+        teacher_logits = teacher_logits.detach()
+
+        # ===== Magnitude-Enhanced KL (MKL) =====
+        # Build target-logit shrinkage from teacher confidence gap.
+        teacher_target_logits = teacher_logits[batch_indices, targets]
+        target_mask = F.one_hot(targets, num_classes=num_classes).bool()
+        teacher_non_target_max = teacher_logits.masked_fill(target_mask, float("-inf")).max(dim=1).values
+        shrinkage_base = teacher_target_logits - teacher_non_target_max
+
+        kl_losses = []
+        for lambda_m in shrinkage_coeffs:
+            delta = lambda_m * shrinkage_base
+            student_logits_modified = self._apply_target_shrinkage(student_logits, targets, delta)
+            teacher_logits_modified = self._apply_target_shrinkage(teacher_logits, targets, delta)
+
+            log_probs_student = F.log_softmax(student_logits_modified / self.temperature, dim=1)
+            probs_teacher = F.softmax(teacher_logits_modified / self.temperature, dim=1)
+
+            kl_div = F.kl_div(log_probs_student, probs_teacher, reduction="batchmean")
+            kl_losses.append(kl_div)
+
+        mkl_loss = torch.stack(kl_losses).mean() * (self.temperature ** 2)
+        total_loss = self.alpha * ce_loss + self.beta * mkl_loss
+        return total_loss
 
 # --------------------------------------
 #           FROM GIT CLONE
@@ -147,9 +244,11 @@ def load_checkpoint(model, path):
 # --------------------------------------
 #               TRAINING
 # --------------------------------------
-def train(net, epoch, trainloader, optimizer, criterion, device):
+def train(net, epoch, trainloader, optimizer, criterion, device, teacher_model=None):
     print('\nEpoch: %d' % epoch)
     net.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     train_loss = 0
     correct = 0
     total = 0
@@ -161,7 +260,12 @@ def train(net, epoch, trainloader, optimizer, criterion, device):
         optimizer.zero_grad()
         outputs = net(inputs)
         #loss = criterion(outputs.float(), targets) # converts the output back to float32
-        loss = criterion(outputs, targets)
+        if teacher_model is not None:
+            with torch.no_grad():
+                teacher_logits = teacher_model(inputs)
+            loss = criterion(outputs, teacher_logits, targets)
+        else:
+            loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
 

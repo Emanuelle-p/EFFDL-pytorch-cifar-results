@@ -20,6 +20,7 @@ from torchvision.transforms import AutoAugment, AutoAugmentPolicy
 from utils import train, test, load_checkpoint
 from utils import global_pruning, check_sparsity, retrain_after_pruning, prune_filters_structured, apply_thinet
 from utils import apply_binaryconnect, apply_xor_quantization
+from utils import NTCE_KD_Loss
 
 from utils import cutmix_batch
 
@@ -51,6 +52,14 @@ parser.add_argument('--retrain_global_pruning', action='store_true', help='Apply
 parser.add_argument('--gradual_structured_prune', action='store_true', help='Apply gradual structured filter pruning with retraining for each pruning ratio.')
 parser.add_argument('--ps_pu_prune_eval_fp16', action='store_true', help='Apply both unstructured and structured pruning sequentially, with retraining in between, and evaluate on fp16')
 parser.add_argument('--thinet', action='store_true', help='Apply ThiNet pruning based on feature map statistics')
+
+# NTCE-KD arguments
+parser.add_argument('--use_ntce_kd', action='store_true', help='Enable NTCE-KD loss during student training.')
+parser.add_argument('--teacher_checkpoint', type=str, default=None, help='Path to teacher checkpoint (.pth) used by NTCE-KD.')
+parser.add_argument('--teacher_model', type=str, default='ResNet20', help='Teacher model class name available in models package.')
+parser.add_argument('--ntce_temperature', type=float, default=4.0, help='Temperature used by NTCE-KD.')
+parser.add_argument('--ntce_alpha', type=float, default=1.0, help='CrossEntropy weight in NTCE-KD.')
+parser.add_argument('--ntce_beta', type=float, default=8.0, help='Distillation (MKL) weight in NTCE-KD.')
 
 args = parser.parse_args()
 
@@ -105,6 +114,32 @@ def main():
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.T_max)
     print(f"Using convolution type: {args.factorization}")
+
+    teacher_model = None
+    if args.use_ntce_kd:
+        if not args.teacher_checkpoint:
+            raise ValueError("--teacher_checkpoint is required when --use_ntce_kd is enabled.")
+        if not os.path.isfile(args.teacher_checkpoint):
+            raise FileNotFoundError(f"Teacher checkpoint not found: {args.teacher_checkpoint}")
+
+        if args.teacher_model not in globals() or not callable(globals()[args.teacher_model]):
+            raise ValueError(f"Teacher model '{args.teacher_model}' not found in models package.")
+
+        print(f"==> Loading teacher model ({args.teacher_model}) from checkpoint: {args.teacher_checkpoint}")
+        teacher_model = globals()[args.teacher_model]().to(device)
+        load_checkpoint(teacher_model, args.teacher_checkpoint)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+
+        criterion = NTCE_KD_Loss(
+            temperature=args.ntce_temperature,
+            alpha=args.ntce_alpha,
+            beta=args.ntce_beta,
+        )
+        print(
+            f"Using NTCE-KD Loss (T={args.ntce_temperature}, alpha={args.ntce_alpha}, beta={args.ntce_beta})"
+        )
     
     
     hparams = {
@@ -134,6 +169,12 @@ def main():
             "architecture": args.model,
             "dataset": "CIFAR-10",
             "epochs": args.epochs,
+            "use_ntce_kd": args.use_ntce_kd,
+            "teacher_model": args.teacher_model if args.use_ntce_kd else None,
+            "teacher_checkpoint": args.teacher_checkpoint if args.use_ntce_kd else None,
+            "ntce_temperature": args.ntce_temperature if args.use_ntce_kd else None,
+            "ntce_alpha": args.ntce_alpha if args.use_ntce_kd else None,
+            "ntce_beta": args.ntce_beta if args.use_ntce_kd else None,
         },
         #name=f"{args.model}-basic_model_75widthscale", #-{args.factorization}",
         #name=f"{args.model}-basic_model-factorization_{args.factorization}",
@@ -196,7 +237,14 @@ def main():
                     optimizer.zero_grad()
                     outputs = net(inputs)
 
-                    loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                    if teacher_model is not None:
+                        with torch.no_grad():
+                            teacher_logits = teacher_model(inputs)
+                        loss_a = criterion(outputs, teacher_logits, targets_a)
+                        loss_b = criterion(outputs, teacher_logits, targets_b)
+                        loss = lam * loss_a + (1 - lam) * loss_b
+                    else:
+                        loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
 
                     loss.backward()
                     optimizer.step()
@@ -245,7 +293,15 @@ def main():
         
         else:
             for epoch in range(start_epoch, start_epoch + args.epochs):
-                train_loss, train_acc = train(net, epoch, trainloader, optimizer, criterion, device)
+                train_loss, train_acc = train(
+                    net,
+                    epoch,
+                    trainloader,
+                    optimizer,
+                    criterion,
+                    device,
+                    teacher_model=teacher_model,
+                )
                 test_loss, test_acc, best_acc = test(net, best_acc, 0, testloader, criterion, device, checkpoint_name, hparams, history)
                 scheduler.step()
 
