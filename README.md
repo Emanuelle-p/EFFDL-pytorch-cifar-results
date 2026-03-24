@@ -1,1 +1,1 @@
-# EFFDL_experiments_and_results
+# EFFDL-pytorch-cifar-results
