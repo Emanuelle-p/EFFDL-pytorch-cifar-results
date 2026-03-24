@@ -68,7 +68,7 @@ def main():
     
     # Device configuration
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    seed  = 2147483647 # We set a seed manually so as to reproduce the results easily
+    seed  = 2147483647 #reproduce the results easily
     torch.manual_seed(seed)
     if device == 'cuda':
         torch.cuda.manual_seed_all(seed)
@@ -80,6 +80,7 @@ def main():
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         #AutoAugment(policy=AutoAugmentPolicy.CIFAR10),
+        #RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
@@ -115,6 +116,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.T_max)
     print(f"Using convolution type: {args.factorization}")
 
+    # NTCE-KD setup
     teacher_model = None
     if args.use_ntce_kd:
         if not args.teacher_checkpoint:
@@ -213,7 +215,6 @@ def main():
     
         
     if args.train:
-        # To use it run:
         # python main.py --train --factorization standard  >> BASIC_MODEL
         # python main.py --train --factorization spatial
         # python main.py --train --factorization depthwise
@@ -341,17 +342,14 @@ def main():
     #            QUANTIZATION
     # --------------------------------------
     
-    # Task: INFERÊNCIA FP16 (eval)
     if args.eval_fp16:
 
-        # Carregar modelo
         net = ResNet18()
         load_checkpoint(net, "checkpoint-ResNet18-global_pruning_retrain/trained_model.pth")
         net = net.to(device)
 
-        # Avaliação
         net.eval()
-        net.half()  # converte para FP16
+        net.half() 
 
         total_loss = 0
         total_correct = 0
@@ -377,19 +375,18 @@ def main():
         print(f"FP16 Test Loss: {avg_loss:.4f}, Test Accuracy: {avg_acc:.2f}%")
 
         # Type checking
-        print("First weight type:", next(net.parameters()).dtype)  # should be torch.float16
+        print("First weight type:", next(net.parameters()).dtype)  
         sample_inputs, _ = next(iter(testloader))
         print("Batch input type:", sample_inputs.to(device).half().dtype)  # torch.float16
 
-        # Log para W&B
         wandb.log({
             "fp16/test_loss": avg_loss,
             "fp16/test_acc": avg_acc
         })
 
-
+    # Binary Connect 
     if args.train_with_binary_connect:
-        # Apply Binary Connect no train
+        
         net = ResNet18()
         #net = ResNet18(conv_type=args.factorization, width_mult=1.0).to(device)
         net = apply_binaryconnect(net, clip_value=1.0, first_last_fp32=True)
@@ -448,12 +445,11 @@ def main():
                 wandb.save(f'checkpoint/trainingBinary_epoch{epoch}.pth')
             
         print("\n==> Finished Training")
-        #wandb.save('checkpoint/training_binary_connect_log.pth')
         wandb.save('checkpoint/trainingBinary_log.pth')
         
-    
+    # XORWrapper
     if args.train_with_xor:
-        # Apply XORWrapper no modelo
+        
         net = ResNet18()
         #net = ResNet18(conv_type=args.factorization, width_mult=1.0).to(device)
         net = apply_xor_quantization(net, first_last_fp32=True)
@@ -489,14 +485,12 @@ def main():
             train_loss = total_loss / total_samples
             train_acc = 100. * total_correct / total_samples
 
-            # Avaliação no teste
             net.eval()
             test_loss, test_acc, best_acc = test(
                 net, best_acc, epoch, testloader, criterion, device, checkpoint_name, hparams, history
             )
             scheduler.step()
 
-            # Log para W&B
             wandb.log({
                 "epoch": epoch,
                 "train/loss": train_loss,
@@ -517,12 +511,12 @@ def main():
     #               PRUNING
     # --------------------------------------
     if args.eval_global_pruning:
-        # Task: Global Pruning, no retrain : simply remove weights with lowest l1 norm, measure accuracy for different pruning ratios
+        
         pruning_ratios = [0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95]
         #checkpoint_model = os.path.join(checkpoint_name, 'trained_model.pth')
         checkpoint_model = os.path.join(checkpoint_name, 'trainingBinary_log.pth')
         
-        # Carregar modelo
+       
         net = ResNet18()
         #net = ResNet18(conv_type=args.factorization, width_mult=1.0).to(device)
         load_checkpoint(net, "checkpoint-ResNet18-global_pruning_retrain/trained_model.pth") #"checkpoint-ResNet18-trainBinary/trainingBinary_log.pth"
@@ -532,7 +526,7 @@ def main():
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.T_max)
 
-        # opcional: DataParallel
+        #optional
         if torch.cuda.device_count() > 1:
             net = torch.nn.DataParallel(net)
 
@@ -543,7 +537,7 @@ def main():
             net_prune = copy.deepcopy(net)
             net_prune = global_pruning(net_prune, amount=ratio)
             
-            # rodar avaliação ou retraining
+           
             test_loss, test_acc, best_acc = test(
                 net_prune, best_acc, 0, testloader, criterion, device, checkpoint_name, hparams, history
             )
@@ -556,11 +550,11 @@ def main():
 
 
     if args.retrain_global_pruning:
-        # Carregar modelo
+        
         net = ResNet18()
         load_checkpoint(net, "checkpoint-ResNet18-global_pruning_retrain/trained_model.pth") #"checkpoint-ResNet18-trainBinary/trainingBinary_log.pth"
         net = net.to(device)
-        net.eval()  # importante para usar os running_mean/var do BN
+        net.eval()  
         
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
@@ -569,14 +563,12 @@ def main():
         test_loss, test_acc, _ = test(net, best_acc=0, epoch=0, testloader=testloader, criterion=criterion, device=device, checkpoint_name=checkpoint_name)
         print(f"Acurácia final do checkpoint: {test_acc:.2f}%")
 
-        # opcional: DataParallel
         if torch.cuda.device_count() > 1:
             net = torch.nn.DataParallel(net)
 
         best_acc = 0
         net = global_pruning(net, amount=0.4)
 
-        # Task: Learning both Weights and Connections for Efficient Neural Networks : apply a retrain after the first global pruning
         model, history_retrain, sparsity = retrain_after_pruning(
             model=net,
             checkpoint_name=checkpoint_name,
@@ -595,12 +587,12 @@ def main():
 
 
     if args.gradual_structured_prune:
-        # Task: Pruning Filters for Efficient ConvNets : gradually prune and retrain accross layers        
-        # Carregar modelo
+        # Gradually prune and retrain accross layers        
+        
         net = ResNet18()
         load_checkpoint(net, "checkpoint-ResNet18-trainBinary200/trainBinary200.pth")
         net = net.to(device)
-        net.eval()  # importante para usar os running_mean/var do BN
+        net.eval()  
         
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
@@ -619,13 +611,11 @@ def main():
             net_prune = copy.deepcopy(net)
             print(f"\n==> Structured Pruning: removing {int(ratio*100)}% of filters per conv layer")
             
-            # Aplica pruning em todos os filtros das conv layers
             net_prune = prune_filters_structured(net_prune, amount=ratio)
-            # Avalia acurácia antes do retraining
             test_loss, test_acc, _ = test(net_prune, best_acc, 0, testloader, criterion, device, checkpoint_name)
             print(f"Before retrain - Test Accuracy: {test_acc:.2f}%, Loss: {test_loss:.4f}")
             
-            # Retrain para recuperar acurácia
+            # Retrain 
             model, history_retrain, sparsity_dict = retrain_after_pruning(
                 model=net_prune,
                 checkpoint_name=checkpoint_name,
@@ -634,9 +624,7 @@ def main():
                 testloader=testloader,
                 hparams=hparams,
                 device=device,
-                amount=0.0,  # já aplicamos o pruning na camada, não precisamos reaplicar, 
-                # por conta disso o gráfico "retrain/pruning_ratio": amount será uma reta 0
-                # assim, para ter certeza de que as diferentes ratios estão sendo corretamente aplicadas, verifique o gráfico "structured_pruning/sparsity": sparsity_dict['global']
+                amount=0.0, 
                 retrain_epochs=retrain_epochs_per_step,
                 scheduler=scheduler,
                 retrain_lr=0.01,
@@ -646,15 +634,14 @@ def main():
                 )
             )
             
-            # Depois do retrain
             wandb.log({
                 "structured_pruning/test_acc_after_retrain": history_retrain["test_acc"][-1],
                 "structured_pruning/test_loss_after_retrain": history_retrain["test_loss"][-1],
                 "structured_pruning/sparsity": sparsity_dict['global']
             }, commit=False)
 
-            torch.save(model.state_dict(), os.path.join(checkpoint_name, 'BinaryPruning_{ratio}.pth'))
-            wandb.save('checkpoint/BinaryPruning_{ratio}.pth')
+            torch.save(model.state_dict(), os.path.join(checkpoint_name, f'BinaryPruning_{ratio}.pth'))
+            wandb.save(os.path.join(checkpoint_name, f'BinaryPruning_{ratio}.pth'))
 
     if args.ps_pu_prune_eval_fp16:    
         #checkpoint_model = os.path.join(checkpoint_name, 'trained_model.pth')
@@ -662,7 +649,6 @@ def main():
         #checkpoint_model = os.path.join(checkpoint_name, 'cifar10_resnet20-4118986f.pt')
         
     
-        # Carregar modelo
         #net = ResNet18(conv_type="depthwise", width_mult=0.75).to(device)
         net = ResNet20().to(device)
         #load_checkpoint(net, "checkpoint-ResNet18-global_pruning_retrain/trained_model.pth") #"checkpoint-ResNet18-trainBinary/trainingBinary_log.pth"
@@ -687,13 +673,12 @@ def main():
                 total_samples += targets.size(0)
 
         accuracy = 100. * total_correct / total_samples
-        print(f"✅ Checkpoint Accuracy (ps_pu_prune_eval_fp16): {accuracy:.2f}%")
+        print(f"Checkpoint Accuracy (ps_pu_prune_eval_fp16): {accuracy:.2f}%")
         
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.T_max)
         
-        # opcional: DataParallel
         if torch.cuda.device_count() > 1:
             net = torch.nn.DataParallel(net)
 
@@ -702,9 +687,8 @@ def main():
         unstructured_ratio = 0.7
         net_prune = copy.deepcopy(net)
         print(f"\n==> Unstructured Pruning: removing {int(unstructured_ratio*100)}% of weights")
-        net_prune = global_pruning(net_prune, amount=0.4)
+        net_prune = global_pruning(net_prune, amount=unstructured_ratio)
         
-        # Avalia acurácia antes do retraining
         test_loss, test_acc, best_acc = test(
             net_prune, best_acc, 0, testloader, criterion, device, checkpoint_name, hparams, history
         )
@@ -733,13 +717,12 @@ def main():
         net_prune = copy.deepcopy(model)
         print(f"\n==> Structured Pruning: removing {int(structured_pruning_ratio*100)}% of filters per conv layer")
         
-        # Aplica pruning em todos os filtros das conv layers
         net_prune = prune_filters_structured(net_prune, amount=structured_pruning_ratio)
-        # Avalia acurácia antes do retraining
+     
         test_loss, test_acc, _ = test(net_prune, best_acc, 0, testloader, criterion, device, checkpoint_name)
         print(f"Before retrain - Test Accuracy: {test_acc:.2f}%, Loss: {test_loss:.4f}")
         
-        # Retrain para recuperar acurácia
+    
         model, history_retrain, sparsity_dict = retrain_after_pruning(
             model=net_prune,
             checkpoint_name=checkpoint_name,
@@ -748,9 +731,7 @@ def main():
             testloader=testloader,
             hparams=hparams,
             device=device,
-            amount=0.0,  # já aplicamos o pruning na camada, não precisamos reaplicar, 
-            # por conta disso o gráfico "retrain/pruning_ratio": amount será uma reta 0
-            # assim, para ter certeza de que as diferentes ratios estão sendo corretamente aplicadas, verifique o gráfico "structured_pruning/sparsity": sparsity_dict['global']
+            amount=0.0,  
             retrain_epochs=retrain_epochs_per_step,
             scheduler=scheduler,
             retrain_lr=0.01,
@@ -782,17 +763,14 @@ def main():
                 total_correct += predicted.eq(targets).sum().item()
                 total_samples += targets.size(0)
 
-        # Métricas finais
         avg_loss = total_loss / total_samples
         avg_acc = 100. * total_correct / total_samples
         print(f"FP16 Test Loss: {avg_loss:.4f}, Test Accuracy: {avg_acc:.2f}%")
 
-        # --- Checagem de tipos ---
         print("Tipo do primeiro peso:", next(model.parameters()).dtype)  # deve ser torch.float16
         sample_inputs, _ = next(iter(testloader))
         print("Tipo de inputs do batch:", sample_inputs.to(device).half().dtype)  # torch.float16
 
-        # Log para W&B
         wandb.log({
             "fp16/test_loss": avg_loss,
             "fp16/test_acc": avg_acc
@@ -801,11 +779,10 @@ def main():
 
 
     if args.thinet:
-        # Carregar modelo
         net = ResNet18()
         load_checkpoint(net, "checkpoint-ResNet18-global_pruning_retrain/trained_model.pth")
         net = net.to(device)
-        net.eval()  # importante para usar os running_mean/var do BN
+        net.eval()  
         
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
@@ -820,7 +797,6 @@ def main():
             
         best_acc = 0
 
-        # Task: ThiNet: same, but based on the norms of feature maps
         pruning_ratios = [0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95]
         checkpoint_model = os.path.join(checkpoint_name, 'trained_model.pth')
 
@@ -862,7 +838,7 @@ def main():
             )
 
             wandb.log({
-                "thinet/test_acc_after_retrain": history["test_acc"][-1],
+                "thinet/test_acc_after_retrain": history_retrain["test_acc"][-1],
                 "thinet/test_loss_after_retrain": history_retrain["test_loss"][-1],
                 "thinet/sparsity_after_retrain": sparsity_dict["global"]
             }, commit=False)
